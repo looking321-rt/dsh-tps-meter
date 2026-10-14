@@ -28,7 +28,7 @@
     }
   },
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test \"test/**/*.test.mjs\"",
     "preview": "node test/preview.mjs"
   },
   "engines": {

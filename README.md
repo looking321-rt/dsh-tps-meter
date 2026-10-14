@@ -14,7 +14,7 @@
 
 | 项 | 要求 |
 |---|---|
-| **DSH** | 需要支持会话事件 firehose（`session/event`）与页面注入（`webServer.register` / `tapIndex`）的 DeepSeek Harness 桌面版。开发与实测环境：DSH 桌面版（`@deepseek-ai/*` 0.1.1-rc.2 一代），Web 界面 |
+| **DSH** | 需要支持会话事件 firehose（`session/event`）、**实时助手流**（`agent/assistant-stream`）与页面注入（`webServer.register` / `tapIndex`）的 DeepSeek Harness 桌面版。开发与实测环境：**DSH 桌面版 0.2.0-rc.2**（`@deepseek-ai/*` 0.2.0-rc.2），Web 界面 |
 | **操作系统** | 宿主逻辑跨平台（Windows / macOS / Linux 均可）；`install.ps1` 一键安装脚本仅 Windows，其它平台用两条命令手动装（见下文） |
 | **运行时依赖** | **零第三方依赖**：宿主侧只用 Node 内置模块（`fs` / `path` / `url`），浮窗是纯 ES5 脚本（无框架、无构建） |
 | **Node** | 宿主插件运行在 DSH 进程内，不单独跑 Node；代码只用 ES2020 语法，DSH 自带运行时即可 |
@@ -33,13 +33,13 @@
 | 纯终端 / headless（不起 Web 服务）| ❌ | 浮窗靠往页面注入脚本显示，没有页面就没有落点 |
 | 其他 AI 客户端（Claude Code / Cursor / Codex CLI 等）| ❌ | 不是 DSH 插件体系，没有 `session/event` 与 `webServer` 这两套扩展点 |
 
-只依赖两项宿主能力：**会话事件 firehose**（`session/event`）与 **Web 服务扩展点**（`ctx.webServer.register` / `tapIndex`）。
+只依赖两项宿主能力：**实时助手流 + 会话事件 firehose**（`agent/assistant-stream`、`session/event`）与 **Web 服务扩展点**（`ctx.webServer.register` / `tapIndex`）。
 
 ### 权限与隐私
 
 | 项 | 说明 |
 |---|---|
-| 读取 | 只订阅 DSH 的会话事件用于换算速度：`turn/start`、`step/start`、`assistant/chunk`、`assistant/message`、`tool/call`、`tool/result`、`turn/end`、`session/title` |
+| 读取 | 实时吞吐订阅 `agent/assistant-stream`（模型每吐一个 chunk 一帧，`frame.chunk` 是原始分片）；生命周期与精确 usage 订阅 `session/event`：`turn/start`、`step/start`、`turn/end`、`assistant/attempt`、`assistant/message`、`tool/call`、`tool/result`、`session/title` |
 | 不写 | 不改会话日志、不注入提示词、不发起模型请求、不读取工作区文件 |
 | 网络 | 宿主侧不联网；浮窗只轮询本机 `127.0.0.1` 上的 DSH 服务，不访问任何第三方服务 |
 | 本地存储 | 仅浮窗偏好写入浏览器 `localStorage`：位置、折叠状态、速度口径、选中的会话、已关闭的会话列表 |
@@ -103,12 +103,18 @@
 
 ## 数据来源
 
-宿主侧订阅会话事件 firehose（`ctx.on('session/event')`），只读、不写会话日志、不碰模型请求：
+宿主侧订阅**两条**通道（`ctx.on(...)`），只读、不写会话日志、不碰模型请求：
 
 ```
-assistant/chunk (text-delta / reasoning-delta / tool-call-delta / usage)
-assistant/message (提供方精确 usage)
-step/start · turn/start · turn/end · session/title（会话标题）
+agent/assistant-stream   ← 实时主数据源：模型每吐一个 chunk 一帧
+   frame.type: start | chunk | end
+   frame.chunk: text-delta / reasoning-delta / tool-call-delta / usage / finish …
+   frame.index: attempt 内自增序号（天然增量，不会重复计数）
+        │
+session/event            ← 生命周期与精确 usage
+   step/start · turn/start · turn/end · session/title（会话标题）
+   tool/call · tool/result
+   assistant/attempt · assistant/message（提供方精确 usage，用于估算校正）
         │
         ▼
   tracker.js  滑动窗口 + 估算校正
@@ -116,6 +122,17 @@ step/start · turn/start · turn/end · session/title（会话标题）
         ▼
   GET /dsh-tps/state.json   ← 浮窗每 400ms 轮询
 ```
+
+> **为什么实时读数不会重复计数**：两条通道职责分离——`agent/assistant-stream` 是
+> **逐 chunk 的增量**，负责实时窗口；`session/event` 里的 `assistant/message` 携带的
+> `data.stream` 是**该步完整累积的快照**（同一份内容会整份重复出现），因此当某一步
+> 已由实时通道供数时，结算事件只取精确 `usage.outputTokens`、**绝不再遍历快照**。
+>
+> 该实时通道按 agent 作用域路由（`dsh-scope` 的解析器取 `args[0].agent`），插件挂在
+> 应用根上下文、不在任何 agent 作用域内，故订阅时**必须**带 `{ global: true }`，
+> 否则 Cordis 的作用域过滤会让插件一帧都收不到（静默失效）。
+
+兼容性：更老的宿主若只发旧式 `assistant/chunk` 增量事件，插件仍会处理它（该分支保留）。
 
 token 估算启发式：ASCII 4 字符 ≈ 1 token，非 ASCII 字符（中文等）≈ 0.6 token；随后由提供方 usage 自动校正。
 
@@ -203,3 +220,5 @@ node test/preview.mjs           # 本地预览服务 http://127.0.0.1:8899/（mo
 - **多标签页各自轮询**：每个打开的 DSH 页面都会拉起自己的浮窗与轮询（互不干扰）。
 - **会话识别靠"最活跃"**：浮窗不读取界面当前选中的会话，只按活跃度排序（subagent 会话排在主会话之后）。
 - **MS 精度**：速度基于事件时间戳（宿主与浏览器同机），跨机部署时以宿主时钟为准。
+- **停用是即时的，启用要重载页面**：宿主插件被停用/卸载后，`/dsh-tps/state.json` 变为 404，浮窗在连续 3 次 404 后**自行移除并停止轮询**（宿主临时故障的 5xx / 超时不会误删，仍会继续重试）。但注入发生在**页面加载时**，所以重新启用后浮窗不会自己回来，需要重载一次页面 —— 桌面端按 `F12` 打开控制台执行 `location.reload()`（正式版桌面端没有「刷新页面」菜单，`Ctrl+R` 与 `F5` 均未绑定）。
+- **插件开关与 bundle 层**：本插件以 `dsh.profile.bundles` 的组合包形式注册。插件页的**组合包开关**改的是 profile 的 `package.json`；DSH 的插件管理器在 YAML 启用 HMR 时配置变化立即生效，否则运行中的组合保留到重启（见其 `README.zh.md`）。

@@ -59,6 +59,15 @@ function fakeEl() {
     appendChild(kid) {
       this._kids = this._kids || []
       this._kids.push(kid)
+      kid.parentNode = this
+      return kid
+    },
+    removeChild(kid) {
+      if (this._kids) {
+        const at = this._kids.indexOf(kid)
+        if (at >= 0) this._kids.splice(at, 1)
+      }
+      kid.parentNode = null
       return kid
     },
     setAttribute(k, v) {
@@ -131,11 +140,14 @@ function startWidget() {
   }
 
   let payload = { ok: true, sessions: [] }
+  // 端点响应实现：默认回放 push() 推进来的读数，可由 setFetch 替换，
+  // 用于模拟「插件已停用（404）」与「宿主临时故障（5xx）」两类失败。
+  let fetchImpl = async () => ({ status: 200, ok: true, json: async () => payload })
   const sandbox = {
     window: env.window,
     document: env.document,
     localStorage: env.localStorage,
-    fetch: async () => ({ ok: true, json: async () => payload }),
+    fetch: (...args) => fetchImpl(...args),
     setTimeout: () => 0,
     setInterval: () => 0,
     clearTimeout: () => {},
@@ -156,6 +168,16 @@ function startWidget() {
   /** 推一轮宿主读数（顺带触发一次轮询渲染）。 */
   env.push = async (sessions) => {
     payload = { ok: true, now: Date.now(), sessions }
+    for (const fn of visibility) fn()
+    await flush()
+    await flush()
+  }
+  /** 替换端点响应实现（模拟停用 404 / 临时故障 5xx）。 */
+  env.setFetch = (fn) => {
+    fetchImpl = fn
+  }
+  /** 只触发一次轮询，不改变 payload。 */
+  env.poll = async () => {
     for (const fn of visibility) fn()
     await flush()
     await flush()
@@ -324,4 +346,62 @@ test('跨工作区多会话：会话频繁进出列表（新会话加入 / 短�
   // s4 是新加入的：只能追加到队尾，不许把 s1/s2/s3 顶下去。
   const joined = seen[4]
   assert.equal(joined.join(','), 's1,s2,s3', `新会话应追加队尾（前 3 行仍是老会话），实际 ${joined.join(',')}`)
+})
+
+// ── 插件停用后的自清理 ──────────────────────────────────────────────────
+// 宿主插件被停用/卸载后，`/dsh-tps/state.json` 会变 404。此前浮窗只会清空
+// 数据、继续留在页面上（用户看到一个「打开但没数据」的空壳，只能重启 DSH
+// 才能清掉）。下面把「停用即自行移除」以及「临时故障不得误删」钉死。
+
+const notFoundRes = async () => ({ status: 404, ok: false, json: async () => ({}) })
+const serverErrorRes = async () => ({ status: 503, ok: false, json: async () => ({}) })
+
+test('插件停用（404）：浮窗自行移除，不留「打开但没数据」的空壳', async () => {
+  const ui = startWidget()
+  await ui.push([reading('a')])
+  assert.equal(ui.rows().length, 1, '初始应显示会话行')
+  assert.notEqual(ui.root.parentNode, null, '初始应挂在 body 上')
+
+  ui.setFetch(notFoundRes)
+
+  // 单次、两次 404 不足以判定（避开宿主重启等瞬时抖动）
+  await ui.poll()
+  await ui.poll()
+  assert.notEqual(ui.root.parentNode, null, '未达阈值前不应移除浮窗')
+
+  await ui.poll()
+  assert.equal(ui.root.parentNode, null, '连续 3 次 404 后浮窗应自行移除')
+})
+
+test('宿主临时故障（5xx）：不得误删浮窗', async () => {
+  const ui = startWidget()
+  await ui.push([reading('a')])
+
+  ui.setFetch(serverErrorRes)
+  for (let i = 0; i < 6; i += 1) await ui.poll()
+
+  assert.notEqual(
+    ui.root.parentNode,
+    null,
+    '5xx 只说明宿主临时不可用（可能马上恢复），不应移除浮窗',
+  )
+})
+
+test('404 后端点恢复：计数重置，浮窗保留', async () => {
+  const ui = startWidget()
+  await ui.push([reading('a')])
+
+  ui.setFetch(notFoundRes)
+  await ui.poll()
+  await ui.poll()
+
+  // 端点恢复（例如插件被重新启用且页面重载）→ notFound 归零
+  ui.setFetch(async () => ({ status: 200, ok: true, json: async () => ({ ok: true, sessions: [reading('a')] }) }))
+  await ui.poll()
+  assert.notEqual(ui.root.parentNode, null, '恢复后浮窗应仍在')
+
+  // 再次 404 时计数从头算：单次不足以移除
+  ui.setFetch(notFoundRes)
+  await ui.poll()
+  assert.notEqual(ui.root.parentNode, null, '成功响应后计数应已重置')
 })
